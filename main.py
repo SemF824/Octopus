@@ -1,57 +1,63 @@
+import os
+import uuid
+import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-import uuid
-import os
-from sqlalchemy import create_backend, create_engine
+from sqlalchemy import create_engine, Column, String, Float, DateTime
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# Railway injecte automatiquement l'URL de la base dans cette variable
-DATABASE_URL = os.getenv("DATABASE_URL") 
+# ==========================================
+# 1. CONFIGURATION DE LA BASE DE DONNÉES
+# ==========================================
+# Railway injecte DATABASE_URL. Si vide (local), on utilise SQLite.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Correction pour SQLAlchemy (Postgresql:// au lieu de Postgres://)
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./nexus_local.db"
+
+# Configuration de SQLAlchemy
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Modèle SQL pour la table de logs (Visibilité Railway)
+class TicketLog(Base):
+    __tablename__ = "ticket_logs"
+    id_ticket = Column(String, primary_key=True)
+    date_insertion = Column(DateTime, default=datetime.datetime.utcnow)
+    utilisateur = Column(String)
+    domaine = Column(String)
+    score_final = Column(Float)
+    ethique_veto = Column(String)
+    equipe_cible = Column(String)
+
+# Création automatique des tables au démarrage
+Base.metadata.create_all(bind=engine)
+
 # ==========================================
-# 1. INITIALISATION DE L'API
+# 2. INITIALISATION DE L'API
 # ==========================================
 app = FastAPI(
     title="Nexus-Surgical Engine API",
-    description="Moteur de qualification et de routage intelligent des tickets de support.",
-    version="1.0"
+    description="Moteur de qualification et de routage intelligent des tickets.",
+    version="1.1"
 )
 
-
 # ==========================================
-# 2. MODÈLES DE DONNÉES (Validation stricte)
+# 3. MODÈLES DE DONNÉES (Pydantic)
 # ==========================================
-# Pydantic s'assure que les données envoyées par le client sont correctes avant même le traitement.
 class TicketEntrant(BaseModel):
     nom_utilisateur: str = Field(..., examples=["Dupont"])
-    rang: str = Field(
-        ...,
-        examples=["VIP"],
-        description="Stagiaire, Employé, Cadre, Directeur, VIP"
-    )
-    domaine: str = Field(
-        ...,
-        examples=["MÉDICAL"],
-        description="MÉDICAL, INFRA, RH, MATÉRIEL"
-    )
+    rang: str = Field(..., examples=["VIP"], description="Stagiaire, Employé, Cadre, Directeur, VIP")
+    domaine: str = Field(..., examples=["MÉDICAL"], description="MÉDICAL, INFRA, RH, MATÉRIEL")
     titre: str = Field(..., examples=["Arrêt respiratoire"])
     details: str = Field("", examples=["Le patient ne respire plus."])
-    etat_declare: str = Field(
-        ...,
-        examples=["URGENT"],
-        description="URGENT ou NORMAL"
-    )
-    score_base: float = Field(
-        ...,
-        examples=[10.0],
-        description="Gravité intrinsèque du problème (0 à 10)"
-    )
+    etat_declare: str = Field(..., examples=["URGENT"], description="URGENT ou NORMAL")
+    score_base: float = Field(..., examples=[10.0], description="Gravité (0 à 10)")
 
 class DecisionRoutage(BaseModel):
     id_ticket: str
@@ -61,38 +67,28 @@ class DecisionRoutage(BaseModel):
     ethique_veto: str
     equipe_cible: str
 
-
-# Dictionnaire des importances (SLA)
 RANGS = {"Stagiaire": 1, "Employé": 2, "Cadre": 3, "Directeur": 4, "VIP": 5}
 
-
 # ==========================================
-# 3. LE CŒUR DU MOTEUR (Logique Métier)
+# 4. LOGIQUE MÉTIER
 # ==========================================
 def calculer_decision(ticket: TicketEntrant) -> dict:
-    # Récupération de l'importance (SLA), par défaut 1 si inconnu
     importance = RANGS.get(ticket.rang, 1)
-
-    # Règle de Veto Éthique (Sécurité maximale)
     est_veto = (ticket.score_base >= 9.0)
 
     if est_veto:
         score_final = ticket.score_base
         ethique = "OUI (Veto)"
-        identite_finale = ticket.nom_utilisateur  # On masque le rang
+        identite_finale = ticket.nom_utilisateur
     else:
-        # Formule de calcul avec Bonus
-        # Score = Base + Bonus SLA (Max 1.5) + Bonus Urgence (0.5)
         bonus_sla = (importance / 5.0) * 1.5
         bonus_etat = 0.5 if ticket.etat_declare.upper() == "URGENT" else 0.0
-
         score_final = min(10.0, ticket.score_base + bonus_sla + bonus_etat)
         ethique = "NON"
         identite_finale = f"{ticket.nom_utilisateur} ({ticket.rang})"
 
     score_final = round(score_final, 1)
 
-    # Matrice de Routage
     if score_final >= 9.0:
         equipe = f"TASK FORCE {ticket.domaine.upper()}"
     elif score_final >= 5.0:
@@ -109,24 +105,34 @@ def calculer_decision(ticket: TicketEntrant) -> dict:
         "equipe_cible": equipe
     }
 
-
 # ==========================================
-# 4. LES ROUTES DE L'API (Endpoints)
+# 5. ROUTES (Endpoints)
 # ==========================================
 @app.get("/")
 def health_check():
-    """Vérifie que le moteur est en ligne."""
-    return {"statut": "Nexus-Surgical API en ligne et opérationnelle."}
-
+    return {"statut": "Nexus-Surgical API opérationnelle", "database": DATABASE_URL.split("@")[-1]}
 
 @app.post("/api/v1/router", response_model=DecisionRoutage)
 def process_ticket(ticket: TicketEntrant):
-    """
-    Reçoit un ticket en JSON, applique les règles métier et renvoie la décision de routage.
-    """
+    # 1. Calcul de la décision
+    res = calculer_decision(ticket)
+    
+    # 2. Sauvegarde automatique en Base de Données
+    db = SessionLocal()
     try:
-        decision = calculer_decision(ticket)
-        # 💡 Plus tard, c'est ICI que tu ajouteras : db.log_ticket(decision)
-        return decision
+        new_log = TicketLog(
+            id_ticket=res["id_ticket"],
+            utilisateur=res["utilisateur"],
+            domaine=res["domaine"],
+            score_final=res["score_final"],
+            ethique_veto=res["ethique_veto"],
+            equipe_cible=res["equipe_cible"]
+        )
+        db.add(new_log)
+        db.commit()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors du calcul : {str(e)}")
+        print(f"Erreur Logging: {e}")
+    finally:
+        db.close()
+        
+    return res
